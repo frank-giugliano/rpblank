@@ -18,6 +18,19 @@ Steam logs "Streaming started"  ─►  connect scripts ─► wake ─► DDC o
 Steam logs "Encoding complete"  ─►  grace period ─► DDC on ─► stop scripts
 ```
 
+## Requirements
+
+- Windows 10/11 and Steam (any Remote Play client on the other end).
+- A monitor that answers DDC/CI. Most do; check it's enabled in the OSD. Displays that
+  don't can still be blanked with a command (HDMI-CEC, smart plug, …).
+- **Optional:** Steam's virtual display (the SudoVDA driver). rpblank does not need it and
+  does not interact with it. You want it anyway if you run games in borderless window:
+  the desktop then becomes the client's resolution for the session (e.g. 1280×800 for a
+  Deck) instead of rendering at your monitor's native resolution and downscaling. With it
+  on, Steam may disable the physical output for the session; rpblank's DDC commands then
+  fail harmlessly (`I2C` lines in the log) and it restores normally once Steam hands the
+  display back.
+
 ## Features
 
 - **Detects sessions from Steam itself.** Tails `Steam\logs\streaming_log.txt`; no Steam
