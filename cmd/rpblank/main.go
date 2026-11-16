@@ -1,5 +1,6 @@
-// rpblank blanks your physical screens over DDC/CI while a Steam Remote Play session runs
-// and runs your scripts around it. It never changes the Windows display topology.
+// rpblank switches your physical screens off while a Steam Remote Play session runs, moves
+// the default audio device, and runs your scripts around it. Screens are taken out of the
+// active Windows layout for the session only; the change is never saved.
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 	"runtime"
 	"time"
 
+	"rpblank/internal/audio"
 	"rpblank/internal/config"
 	"rpblank/internal/display"
 	"rpblank/internal/hooks"
@@ -27,9 +29,9 @@ var version = "dev"
 
 func main() {
 	dir := flag.String("dir", "", "data directory for config, state and logs (default: next to the exe)")
-	blank := flag.Bool("blank", false, "blank the configured displays now and exit")
-	restore := flag.Bool("restore", false, "restore the configured displays now and exit")
-	list := flag.Bool("list", false, "list displays and DDC support, then exit")
+	blank := flag.Bool("blank", false, "switch the ticked screens off now and exit (needs a virtual display)")
+	restore := flag.Bool("restore", false, "restore the screens now and exit")
+	list := flag.Bool("list", false, "list displays and audio devices, then exit")
 	open := flag.Bool("open", true, "open the web UI in the browser when started by hand (Windows)")
 	flag.Parse()
 
@@ -56,21 +58,32 @@ func main() {
 		_ = store.Set(store.Get()) // write defaults so the file exists for editing
 	}
 	disp := display.New()
+	aud := audio.New()
 
 	if *list {
 		infos, err := disp.List()
 		if err != nil {
 			fatal(err)
 		}
+		fmt.Println("Displays (active outputs):")
 		for _, d := range infos {
-			state := "no DDC"
-			if d.DDC {
-				state = fmt.Sprintf("DDC ok, power=%d", d.Power)
+			kind := ""
+			if d.Virtual {
+				kind = "  [virtual]"
 			}
-			fmt.Printf("%-28s %-14s %s\n   id: %s\n", d.Name, d.Device, state, d.ID)
-			if d.Err != "" {
-				fmt.Printf("   %s\n", d.Err)
+			fmt.Printf("  %s%s\n     id: %s\n", d.Name, kind, d.ID)
+		}
+		devs, err := aud.List()
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Println("Playback devices:")
+		for _, d := range devs {
+			def := ""
+			if d.Default {
+				def = "  [default]"
 			}
+			fmt.Printf("  %s (%s)%s\n     id: %s\n", d.Name, d.State, def, d.ID)
 		}
 		return
 	}
@@ -85,7 +98,7 @@ func main() {
 	log.SetFlags(log.LstdFlags)
 
 	hk := &hooks.Runner{LogPath: hooksLog}
-	sess := session.New(store, disp, hk, statePath)
+	sess := session.New(store, disp, aud, hk, statePath)
 
 	if *blank {
 		sess.Blank()
@@ -109,7 +122,6 @@ func main() {
 
 	stop := make(chan struct{})
 	defer close(stop)
-	go sess.RunIdle(stop)
 	go steamlog.Watch(steamlog.Candidates(), time.Second, stop, func(ev steamlog.Event) {
 		if ev.Start {
 			log.Printf("Remote Play session started (client %q)", ev.Client)
@@ -120,7 +132,7 @@ func main() {
 		}
 	})
 
-	h := server.New(store, disp, sess, hk, logPath, version)
+	h := server.New(store, disp, aud, sess, hk, logPath, version)
 	if *open && runtime.GOOS == "windows" && !startedByTask() {
 		openURL("http://" + addr + "/")
 	}

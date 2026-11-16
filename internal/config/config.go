@@ -12,45 +12,46 @@ import (
 	"rpblank/internal/hooks"
 )
 
-// Display is a physical monitor rpblank may blank over DDC/CI.
+// Display is a screen rpblank may switch off during a session.
 type Display struct {
-	// ID is the stable device instance path (Windows) or a fake id on other platforms.
+	// ID is the monitor's device interface path (Windows) or a fake id on other platforms.
 	ID string `json:"id"`
-	// Blank marks the display for blanking during a session.
+	// Blank marks the display to be switched off while a session runs.
 	Blank bool `json:"blank"`
-	// OffValue is the VCP D6 value that powers the panel down (4 = off, 5 = hard off on some).
-	OffValue int `json:"offValue"`
 }
+
+// AudioPrevious, as Config.AudioDisconnect, means "whatever was the default before the
+// session".
+const AudioPrevious = "previous"
 
 // Config is the on-disk layout.
 type Config struct {
-	// Displays maps a display id to its settings; unknown displays default to not blanked.
+	// Displays maps a display id to its settings; unknown displays default to left on.
 	Displays map[string]Display `json:"displays"`
-	// OffCommands / OnCommands are extra command lines run at blank and restore time, for
-	// screens DDC cannot reach (a TV over CEC, a smart plug).
+	// AudioConnect is the playback device id made default when a session is detected
+	// ("" = leave audio alone). AudioConnectName is its name, kept for display when the
+	// device is not present.
+	AudioConnect     string `json:"audioConnect"`
+	AudioConnectName string `json:"audioConnectName"`
+	// AudioDisconnect is the device made default after a session: "" = leave alone,
+	// "previous" = the default from before the session, otherwise a device id.
+	AudioDisconnect     string `json:"audioDisconnect"`
+	AudioDisconnectName string `json:"audioDisconnectName"`
+	// OffCommands / OnCommands are extra command lines run when screens go dark and when
+	// they come back (a TV over CEC, a smart plug).
 	OffCommands []string `json:"offCommands"`
 	OnCommands  []string `json:"onCommands"`
-	// OnConnect runs the instant a session is detected, before the wake and blank — the
-	// place to pin the default audio device before Steam opens its capture.
+	// OnConnect runs the instant a session is detected, before anything else.
 	OnConnect []string `json:"onConnect"`
 	// OnStart / OnStop run after blanking and after restoring.
 	OnStart []string `json:"onStart"`
 	OnStop  []string `json:"onStop"`
 	// Clients, when non-empty, limits action to these client names (case-insensitive).
 	Clients []string `json:"clients"`
-	// WakeDisplay sends a synthetic key press at session start so a sleeping monitor wakes
-	// before Steam creates its capture.
-	WakeDisplay bool `json:"wakeDisplay"`
-	// WakeSettleSec waits after the wake before any DDC command: a panel told to go to
-	// standby while still powering up can stop listening to DDC entirely.
-	WakeSettleSec int `json:"wakeSettleSec"`
-	// IdleBlankMin blanks the displays after this many minutes without input, outside of
-	// sessions, so Windows' own display sleep can be set to Never. 0 disables it. With
-	// Windows never sleeping the display, Steam's capture always comes up live.
-	IdleBlankMin int `json:"idleBlankMin"`
-	// GraceSec is how long a session must be gone before restoring (absorbs reconnects).
+	// GraceSec is how long a session must be gone before restoring (absorbs reconnects
+	// and switching games).
 	GraceSec int `json:"graceSec"`
-	// StopDelaySec waits after restore before OnStop runs (HDMI audio endpoints re-enumerate).
+	// StopDelaySec waits after restore before OnStop runs.
 	StopDelaySec int `json:"stopDelaySec"`
 	// TimeoutSec bounds each command.
 	TimeoutSec int `json:"timeoutSec"`
@@ -66,7 +67,6 @@ func Default() Config {
 		OnStart:      []string{},
 		OnStop:       []string{},
 		Clients:      []string{},
-		WakeDisplay:  true,
 		GraceSec:     20,
 		StopDelaySec: 3,
 		TimeoutSec:   60,
@@ -80,14 +80,8 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
-	if c.IdleBlankMin < 0 || c.IdleBlankMin > 1440 {
-		return errors.New("idleBlankMin must be 0–1440")
-	}
 	if c.GraceSec < 0 || c.GraceSec > 3600 {
 		return errors.New("graceSec must be 0–3600")
-	}
-	if c.WakeSettleSec < 0 || c.WakeSettleSec > 60 {
-		return errors.New("wakeSettleSec must be 0–60")
 	}
 	if c.StopDelaySec < 0 || c.StopDelaySec > 600 {
 		return errors.New("stopDelaySec must be 0–600")
@@ -98,10 +92,8 @@ func (c Config) Validate() error {
 	if len(c.Clients) > 64 || len(c.Displays) > 64 {
 		return errors.New("too many entries")
 	}
-	for id, d := range c.Displays {
-		if d.OffValue != 0 && (d.OffValue < 2 || d.OffValue > 5) {
-			return fmt.Errorf("display %s: offValue must be 2–5", id)
-		}
+	if len(c.AudioConnect) > 512 || len(c.AudioDisconnect) > 512 || len(c.AudioConnectName) > 512 || len(c.AudioDisconnectName) > 512 {
+		return errors.New("audio device id too long")
 	}
 	return nil
 }

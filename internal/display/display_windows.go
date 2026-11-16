@@ -3,312 +3,316 @@
 package display
 
 import (
+	"encoding/binary"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
+// Everything here goes through QueryDisplayConfig / SetDisplayConfig and is applied WITHOUT
+// SDC_SAVE_TO_DATABASE, so Windows' remembered layouts are never rewritten: a reboot, or
+// SDC_USE_DATABASE_CURRENT, always returns to the user's own layout.
+
 var (
 	user32 = windows.NewLazySystemDLL("user32.dll")
-	dxva2  = windows.NewLazySystemDLL("dxva2.dll")
 
-	procEnumDisplayMonitors = user32.NewProc("EnumDisplayMonitors")
-	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
-	procEnumDisplayDevices  = user32.NewProc("EnumDisplayDevicesW")
-	procSendInput           = user32.NewProc("SendInput")
-
-	procGetNumberOfPhysicalMonitors = dxva2.NewProc("GetNumberOfPhysicalMonitorsFromHMONITOR")
-	procGetPhysicalMonitors         = dxva2.NewProc("GetPhysicalMonitorsFromHMONITOR")
-	procDestroyPhysicalMonitors     = dxva2.NewProc("DestroyPhysicalMonitors")
-	procGetVCPFeature               = dxva2.NewProc("GetVCPFeatureAndVCPFeatureReply")
-	procSetVCPFeature               = dxva2.NewProc("SetVCPFeature")
-	procGetCapabilitiesStringLength = dxva2.NewProc("GetCapabilitiesStringLength")
+	procGetDisplayConfigBufferSizes = user32.NewProc("GetDisplayConfigBufferSizes")
+	procQueryDisplayConfig          = user32.NewProc("QueryDisplayConfig")
+	procSetDisplayConfig            = user32.NewProc("SetDisplayConfig")
+	procDisplayConfigGetDeviceInfo  = user32.NewProc("DisplayConfigGetDeviceInfo")
 )
 
-type rect struct{ Left, Top, Right, Bottom int32 }
+const (
+	qdcOnlyActivePaths = 0x00000002
 
-type monitorInfoEx struct {
-	Size    uint32
-	Monitor rect
-	Work    rect
-	Flags   uint32
-	Device  [32]uint16
+	sdcUseDatabaseCurrent       = 0x0000000F
+	sdcUseSuppliedDisplayConfig = 0x00000020
+	sdcApply                    = 0x00000080
+	sdcAllowChanges             = 0x00000400
+
+	dcModeIdxInvalid       = 0xffffffff
+	dcModeInfoTypeSource   = 1
+	dcDeviceInfoTargetName = 2
+
+	// DISPLAYCONFIG_OUTPUT_TECHNOLOGY values for indirect (IddCx) displays.
+	dcTechIndirectWired   = 16
+	dcTechIndirectVirtual = 17
+
+	errorInsufficientBuffer = 122
+)
+
+type luid struct {
+	Low  uint32
+	High int32
 }
 
-type physicalMonitor struct {
-	Handle      windows.Handle
-	Description [128]uint16
+// DISPLAYCONFIG_PATH_INFO: 20 + 48 + 4 = 72 bytes.
+type dcPathSource struct {
+	Adapter luid
+	ID      uint32
+	ModeIdx uint32
+	Status  uint32
 }
 
-type displayDevice struct {
-	Size         uint32
-	DeviceName   [32]uint16
-	DeviceString [128]uint16
-	StateFlags   uint32
-	DeviceID     [128]uint16
-	DeviceKey    [128]uint16
+type dcPathTarget struct {
+	Adapter    luid
+	ID         uint32
+	ModeIdx    uint32
+	Tech       uint32
+	Rotation   uint32
+	Scaling    uint32
+	RefreshNum uint32
+	RefreshDen uint32
+	ScanLine   uint32
+	Available  int32
+	Status     uint32
 }
 
-const eddGetDeviceInterfaceName = 0x1
+type dcPath struct {
+	Source dcPathSource
+	Target dcPathTarget
+	Flags  uint32
+}
+
+// DISPLAYCONFIG_MODE_INFO: 16-byte header + 48-byte union = 64 bytes. For a source mode
+// the union holds width, height, pixelFormat, position.x, position.y (5 × 4 bytes).
+type dcMode struct {
+	InfoType uint32
+	ID       uint32
+	Adapter  luid
+	Data     [48]byte
+}
+
+// DISPLAYCONFIG_TARGET_DEVICE_NAME: 420 bytes.
+type dcTargetName struct {
+	Type      uint32
+	Size      uint32
+	Adapter   luid
+	ID        uint32
+	Flags     uint32
+	Tech      uint32
+	EdidMfg   uint16
+	EdidProd  uint16
+	Connector uint32
+	Friendly  [64]uint16
+	Path      [128]uint16
+}
+
+func init() {
+	// These layouts are passed straight to user32; a wrong size would corrupt the call.
+	if unsafe.Sizeof(dcPath{}) != 72 || unsafe.Sizeof(dcMode{}) != 64 || unsafe.Sizeof(dcTargetName{}) != 420 {
+		panic("display: DISPLAYCONFIG struct layout mismatch")
+	}
+}
 
 type winBackend struct{}
 
 func newBackend() Backend { return winBackend{} }
 
-// enumCallback is created once: syscall.NewCallback has a small process-wide limit, so a
-// callback per call would eventually exhaust it. Results are passed through enumSink under
-// enumMu rather than captured by the closure.
-var (
-	enumMu       sync.Mutex
-	enumSink     map[string]windows.Handle
-	enumCallback = syscall.NewCallback(func(h windows.Handle, _ windows.Handle, _ *rect, _ uintptr) uintptr {
-		var mi monitorInfoEx
-		mi.Size = uint32(unsafe.Sizeof(mi))
-		if r, _, _ := procGetMonitorInfoW.Call(uintptr(h), uintptr(unsafe.Pointer(&mi))); r != 0 {
-			enumSink[windows.UTF16ToString(mi.Device[:])] = h
+// queryActive returns the active paths and their modes.
+func queryActive() ([]dcPath, []dcMode, error) {
+	for try := 0; try < 4; try++ {
+		var np, nm uint32
+		if r, _, _ := procGetDisplayConfigBufferSizes.Call(qdcOnlyActivePaths, uintptr(unsafe.Pointer(&np)), uintptr(unsafe.Pointer(&nm))); r != 0 {
+			return nil, nil, fmt.Errorf("GetDisplayConfigBufferSizes: error %d", r)
 		}
-		return 1
-	})
-)
-
-// hmonitors lists every HMONITOR with its GDI device name (\\.\DISPLAYn).
-func hmonitors() (map[string]windows.Handle, error) {
-	enumMu.Lock()
-	defer enumMu.Unlock()
-	enumSink = map[string]windows.Handle{}
-	if r, _, err := procEnumDisplayMonitors.Call(0, 0, enumCallback, 0); r == 0 {
-		return nil, fmt.Errorf("EnumDisplayMonitors: %w", err)
+		if np == 0 || nm == 0 {
+			return nil, nil, nil
+		}
+		paths := make([]dcPath, np)
+		modes := make([]dcMode, nm)
+		r, _, _ := procQueryDisplayConfig.Call(qdcOnlyActivePaths,
+			uintptr(unsafe.Pointer(&np)), uintptr(unsafe.Pointer(&paths[0])),
+			uintptr(unsafe.Pointer(&nm)), uintptr(unsafe.Pointer(&modes[0])), 0)
+		if r == errorInsufficientBuffer {
+			continue // the topology changed between the two calls
+		}
+		if r != 0 {
+			return nil, nil, fmt.Errorf("QueryDisplayConfig: error %d", r)
+		}
+		return paths[:np], modes[:nm], nil
 	}
-	out := enumSink
-	enumSink = nil
-	return out, nil
+	return nil, nil, fmt.Errorf("QueryDisplayConfig: topology kept changing")
 }
 
-// physical opens the physical monitors behind an HMONITOR; the caller destroys them.
-func physical(h windows.Handle) ([]physicalMonitor, error) {
-	var n uint32
-	if r, _, err := procGetNumberOfPhysicalMonitors.Call(uintptr(h), uintptr(unsafe.Pointer(&n))); r == 0 {
-		return nil, fmt.Errorf("GetNumberOfPhysicalMonitorsFromHMONITOR: %w", err)
-	}
-	if n == 0 {
-		return nil, nil
-	}
-	pm := make([]physicalMonitor, n)
-	if r, _, err := procGetPhysicalMonitors.Call(uintptr(h), uintptr(n), uintptr(unsafe.Pointer(&pm[0]))); r == 0 {
-		return nil, fmt.Errorf("GetPhysicalMonitorsFromHMONITOR: %w", err)
-	}
-	return pm, nil
-}
-
-func destroy(pm []physicalMonitor) {
-	if len(pm) > 0 {
-		procDestroyPhysicalMonitors.Call(uintptr(len(pm)), uintptr(unsafe.Pointer(&pm[0])))
-	}
-}
-
-// monitorDevice returns the i-th monitor attached to a GDI adapter: its stable interface
-// path and its EDID model string.
-func monitorDevice(adapter string, i int) (id, name string) {
-	var dd displayDevice
-	dd.Size = uint32(unsafe.Sizeof(dd))
-	a, _ := windows.UTF16PtrFromString(adapter)
-	if r, _, _ := procEnumDisplayDevices.Call(uintptr(unsafe.Pointer(a)), uintptr(i), uintptr(unsafe.Pointer(&dd)), eddGetDeviceInterfaceName); r == 0 {
+// targetName returns the monitor's device interface path and friendly name for a path.
+func targetName(p *dcPath) (devPath, friendly string) {
+	var n dcTargetName
+	n.Type = dcDeviceInfoTargetName
+	n.Size = uint32(unsafe.Sizeof(n))
+	n.Adapter = p.Target.Adapter
+	n.ID = p.Target.ID
+	if r, _, _ := procDisplayConfigGetDeviceInfo.Call(uintptr(unsafe.Pointer(&n))); r != 0 {
 		return "", ""
 	}
-	return windows.UTF16ToString(dd.DeviceID[:]), windows.UTF16ToString(dd.DeviceString[:])
+	return windows.UTF16ToString(n.Path[:]), windows.UTF16ToString(n.Friendly[:])
+}
+
+// monitorCode pulls the EDID id (e.g. GSM0001) out of a device interface path.
+func monitorCode(devPath string) string {
+	parts := strings.Split(devPath, "#")
+	if len(parts) > 1 {
+		return parts[1]
+	}
+	return devPath
 }
 
 func (winBackend) List() ([]Info, error) {
-	hs, err := hmonitors()
+	paths, _, err := queryActive()
 	if err != nil {
 		return nil, err
 	}
+	seen := map[string]bool{}
 	var out []Info
-	for dev, h := range hs {
-		pm, err := physical(h)
-		if err != nil {
-			out = append(out, Info{ID: dev, Name: dev, Device: dev, Err: err.Error()})
+	for i := range paths {
+		dev, name := targetName(&paths[i])
+		if dev == "" || seen[strings.ToLower(dev)] {
 			continue
 		}
-		for i := range pm {
-			id, name := monitorDevice(dev, i)
-			if id == "" {
-				id = fmt.Sprintf("%s#%d", dev, i)
-			}
-			desc := strings.TrimSpace(windows.UTF16ToString(pm[i].Description[:]))
-			if name == "" || strings.EqualFold(name, "Generic PnP Monitor") {
-				if desc != "" {
-					name = desc
-				}
-			}
-			info := Info{ID: id, Name: fmt.Sprintf("%s #%d", name, i+1), Device: dev}
-			// Probe: D6 read first (gives current power), then brightness (0x10), then the
-			// capabilities string. Many monitors accept a D6 write but refuse to report it,
-			// so a failed probe only marks DDC as unverified; the Off/On buttons stay usable.
-			var cur, max uint32
-			if r, _, _ := procGetVCPFeature.Call(uintptr(pm[i].Handle), VCPPower, 0, uintptr(unsafe.Pointer(&cur)), uintptr(unsafe.Pointer(&max))); r != 0 {
-				info.DDC = true
-				info.Power = int(cur)
-			} else if r, _, _ := procGetVCPFeature.Call(uintptr(pm[i].Handle), 0x10, 0, uintptr(unsafe.Pointer(&cur)), uintptr(unsafe.Pointer(&max))); r != 0 {
-				info.DDC = true
-				info.Err = "power state not readable; brightness is, so writes should work"
-			} else {
-				var capLen uint32
-				if r, _, _ := procGetCapabilitiesStringLength.Call(uintptr(pm[i].Handle), uintptr(unsafe.Pointer(&capLen))); r != 0 && capLen > 0 {
-					info.DDC = true
-					info.Err = "answers DDC capabilities but not reads; try Off/On"
-				} else {
-					info.Err = "no DDC/CI reply (check the monitor's DDC/CI menu setting); Off/On may still work"
-				}
-			}
-			out = append(out, info)
+		seen[strings.ToLower(dev)] = true
+		if name == "" {
+			name = monitorCode(dev)
 		}
-		destroy(pm)
+		tech := paths[i].Target.Tech
+		out = append(out, Info{ID: dev, Name: name, Virtual: tech == dcTechIndirectWired || tech == dcTechIndirectVirtual})
 	}
 	return out, nil
 }
 
-func (winBackend) ReadPower(id string) (int, bool) {
-	hs, err := hmonitors()
-	if err != nil {
-		return 0, false
+func setConfig(paths []dcPath, modes []dcMode, flags uintptr) error {
+	var pp, mp unsafe.Pointer
+	if len(paths) > 0 {
+		pp = unsafe.Pointer(&paths[0])
 	}
-	for dev, h := range hs {
-		pm, err := physical(h)
-		if err != nil {
-			continue
-		}
-		for i := range pm {
-			mid, _ := monitorDevice(dev, i)
-			if mid == "" {
-				mid = fmt.Sprintf("%s#%d", dev, i)
-			}
-			if mid != id {
-				continue
-			}
-			var cur, max uint32
-			r, _, _ := procGetVCPFeature.Call(uintptr(pm[i].Handle), VCPPower, 0, uintptr(unsafe.Pointer(&cur)), uintptr(unsafe.Pointer(&max)))
-			destroy(pm)
-			return int(cur), r != 0
-		}
-		destroy(pm)
+	if len(modes) > 0 {
+		mp = unsafe.Pointer(&modes[0])
 	}
-	return 0, false
+	if r, _, _ := procSetDisplayConfig.Call(uintptr(len(paths)), uintptr(pp), uintptr(len(modes)), uintptr(mp), flags); r != 0 {
+		return fmt.Errorf("SetDisplayConfig: error %d", r)
+	}
+	return nil
 }
 
-func (winBackend) SetPower(id string, value uint32) error {
-	hs, err := hmonitors()
+// snapshot is the layout captured just before the last DisableOutputs that changed anything.
+var (
+	topoMu    sync.Mutex
+	snapPaths []dcPath
+	snapModes []dcMode
+	// noMatchLogged keeps the "nothing to switch off" line from repeating on rechecks.
+	noMatchLogged bool
+)
+
+func (winBackend) DisableOutputs(ids []string) error {
+	topoMu.Lock()
+	defer topoMu.Unlock()
+	paths, modes, err := queryActive()
 	if err != nil {
 		return err
 	}
-	for dev, h := range hs {
-		pm, err := physical(h)
-		if err != nil {
+	want := map[string]bool{}
+	for _, id := range ids {
+		want[strings.ToLower(id)] = true
+	}
+	var keep []dcPath
+	var active []string
+	dropped := 0
+	for i := range paths {
+		dev, _ := targetName(&paths[i])
+		active = append(active, dev)
+		if want[strings.ToLower(dev)] {
+			dropped++
 			continue
 		}
-		for i := range pm {
-			mid, _ := monitorDevice(dev, i)
-			if mid == "" {
-				mid = fmt.Sprintf("%s#%d", dev, i)
-			}
-			if mid != id {
+		keep = append(keep, paths[i])
+	}
+	if dropped == 0 {
+		// Already inactive (Steam or another host disabled it), or the id did not match
+		// any active output; the list makes the second case visible in the log.
+		if !noMatchLogged {
+			noMatchLogged = true
+			log.Printf("disable output: %v not among the active outputs %q; nothing changed", ids, active)
+		}
+		return nil
+	}
+	if len(keep) == 0 {
+		return ErrNoOtherDisplay
+	}
+	noMatchLogged = false
+	log.Printf("disable output: %d active output(s), switching off %d, keeping %d", len(paths), dropped, len(keep))
+
+	// Rebuild the mode table with only the modes the kept paths reference.
+	remap := map[uint32]uint32{}
+	var newModes []dcMode
+	use := func(idx uint32) uint32 {
+		if idx == dcModeIdxInvalid || int(idx) >= len(modes) {
+			return dcModeIdxInvalid
+		}
+		if n, ok := remap[idx]; ok {
+			return n
+		}
+		remap[idx] = uint32(len(newModes))
+		newModes = append(newModes, modes[idx])
+		return remap[idx]
+	}
+	for i := range keep {
+		keep[i].Source.ModeIdx = use(keep[i].Source.ModeIdx)
+		keep[i].Target.ModeIdx = use(keep[i].Target.ModeIdx)
+	}
+	// Windows wants a primary at (0,0). If the display that held the origin was dropped,
+	// slide the remaining desktop so the first kept source sits there.
+	origin := false
+	var first *dcMode
+	for i := range newModes {
+		if newModes[i].InfoType != dcModeInfoTypeSource {
+			continue
+		}
+		if first == nil {
+			first = &newModes[i]
+		}
+		if binary.LittleEndian.Uint32(newModes[i].Data[12:]) == 0 && binary.LittleEndian.Uint32(newModes[i].Data[16:]) == 0 {
+			origin = true
+		}
+	}
+	if !origin && first != nil {
+		dx := int32(binary.LittleEndian.Uint32(first.Data[12:]))
+		dy := int32(binary.LittleEndian.Uint32(first.Data[16:]))
+		for i := range newModes {
+			if newModes[i].InfoType != dcModeInfoTypeSource {
 				continue
 			}
-			r, _, callErr := procSetVCPFeature.Call(uintptr(pm[i].Handle), VCPPower, uintptr(value))
-			destroy(pm)
-			if r == 0 {
-				return fmt.Errorf("SetVCPFeature(D6=%d) on %s: %w", value, id, callErr)
-			}
+			x := int32(binary.LittleEndian.Uint32(newModes[i].Data[12:])) - dx
+			y := int32(binary.LittleEndian.Uint32(newModes[i].Data[16:])) - dy
+			binary.LittleEndian.PutUint32(newModes[i].Data[12:], uint32(x))
+			binary.LittleEndian.PutUint32(newModes[i].Data[16:], uint32(y))
+		}
+	}
+
+	if err := setConfig(keep, newModes, sdcApply|sdcUseSuppliedDisplayConfig|sdcAllowChanges); err != nil {
+		return err
+	}
+	snapPaths = append([]dcPath(nil), paths...)
+	snapModes = append([]dcMode(nil), modes...)
+	return nil
+}
+
+func (winBackend) RestoreOutputs() error {
+	topoMu.Lock()
+	defer topoMu.Unlock()
+	if len(snapPaths) > 0 {
+		p, m := snapPaths, snapModes
+		snapPaths, snapModes = nil, nil
+		// Exactly what was there before, valid as long as the same displays still exist
+		// (i.e. the virtual display has not been torn down yet).
+		if err := setConfig(p, m, sdcApply|sdcUseSuppliedDisplayConfig|sdcAllowChanges); err == nil {
 			return nil
 		}
-		destroy(pm)
 	}
-	return fmt.Errorf("display %s not found (unplugged or asleep?)", id)
-}
-
-// INPUT with the MOUSEINPUT arm (the largest union member): 40 bytes on x64, union at +8.
-type mouseInput struct {
-	Type  uint32
-	_     uint32
-	Dx    int32
-	Dy    int32
-	Data  uint32
-	Flags uint32
-	Time  uint32
-	_     uint32
-	Extra uintptr
-}
-
-var (
-	kernel32                    = windows.NewLazySystemDLL("kernel32.dll")
-	procSetThreadExecutionState = kernel32.NewProc("SetThreadExecutionState")
-	procSendMessageTimeoutW     = user32.NewProc("SendMessageTimeoutW")
-	procGetLastInputInfo        = user32.NewProc("GetLastInputInfo")
-	procGetTickCount            = kernel32.NewProc("GetTickCount")
-	powrprof                    = windows.NewLazySystemDLL("powrprof.dll")
-	procCallNtPowerInformation  = powrprof.NewProc("CallNtPowerInformation")
-)
-
-// DisplayRequired reads the system-wide execution state: the OR of every process's
-// SetThreadExecutionState requests. Games and Steam set ES_DISPLAY_REQUIRED while playing,
-// which is what keeps Windows' own display timeout from firing mid-game.
-func (winBackend) DisplayRequired() bool {
-	const (
-		systemExecutionState = 16
-		esDisplayRequired    = 0x00000002
-	)
-	var state uint32
-	if r, _, _ := procCallNtPowerInformation.Call(systemExecutionState, 0, 0, uintptr(unsafe.Pointer(&state)), 4); r != 0 {
-		return false // NTSTATUS failure: assume not required rather than never blanking
-	}
-	return state&esDisplayRequired != 0
-}
-
-type lastInputInfo struct {
-	Size uint32
-	Time uint32
-}
-
-// IdleSeconds reads the time since the last keyboard/mouse input (real or injected).
-func (winBackend) IdleSeconds() (float64, bool) {
-	var li lastInputInfo
-	li.Size = uint32(unsafe.Sizeof(li))
-	if r, _, _ := procGetLastInputInfo.Call(uintptr(unsafe.Pointer(&li))); r == 0 {
-		return 0, false
-	}
-	now, _, _ := procGetTickCount.Call()
-	// 32-bit tick arithmetic wraps correctly on uint32 subtraction.
-	return float64(uint32(now)-li.Time) / 1000, true
-}
-
-// Wake turns a DPMS-sleeping display back on. Three mechanisms, because no single one is
-// reliable everywhere: a one-pixel mouse jiggle (resets the idle timer and wakes the output
-// like a real user would), the SC_MONITORPOWER "on" broadcast (what nircmd sends), and
-// ES_DISPLAY_REQUIRED (tells the power manager the display is needed right now).
-func (winBackend) Wake() error {
-	const (
-		inputMouse        = 0
-		mouseeventfMove   = 0x0001
-		esDisplayRequired = 0x00000002
-		hwndBroadcast     = 0xffff
-		wmSyscommand      = 0x0112
-		scMonitorpower    = 0xF170
-		smtoAbortIfHung   = 0x0002
-	)
-	var firstErr error
-	in := []mouseInput{
-		{Type: inputMouse, Dx: 1, Dy: 0, Flags: mouseeventfMove},
-		{Type: inputMouse, Dx: -1, Dy: 0, Flags: mouseeventfMove},
-	}
-	if r, _, err := procSendInput.Call(uintptr(len(in)), uintptr(unsafe.Pointer(&in[0])), unsafe.Sizeof(in[0])); r == 0 {
-		firstErr = fmt.Errorf("SendInput: %w", err)
-	}
-	procSetThreadExecutionState.Call(esDisplayRequired)
-	// -1 = on. SendMessageTimeout so a hung window can't block us.
-	procSendMessageTimeoutW.Call(hwndBroadcast, wmSyscommand, scMonitorpower, ^uintptr(0), smtoAbortIfHung, 1000, 0)
-	return firstErr
+	// The virtual display is gone, or rpblank restarted and has no snapshot: ask Windows
+	// for its saved layout for whatever is connected now. rpblank never wrote to that
+	// database, so this is the user's own layout.
+	return setConfig(nil, nil, sdcApply|sdcUseDatabaseCurrent)
 }

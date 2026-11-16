@@ -59,6 +59,7 @@
   .group { padding: 1.25rem 0; border-top: 1px solid var(--line-soft); }
   .group:first-of-type { border-top: 0; padding-top: 0; }
   .group h3 { margin: 0 0 .35rem; font-size: .95rem; font-weight: 600; }
+  p.help { margin: 0 0 1rem; color: var(--muted); font-size: .9rem; max-width: 70ch; }
   .group .help { margin: 0 0 .75rem; color: var(--muted); font-size: .9rem; max-width: 62ch; }
   code { font-family: var(--mono); font-size: .85em; background: #ffffff0d; padding: .05rem .3rem; border-radius: 4px; }
 
@@ -89,13 +90,14 @@
   /* displays */
   .display { display: grid; grid-template-columns: auto 1fr auto; gap: .25rem 1rem; align-items: center; padding: .85rem 0; border-top: 1px solid var(--line-soft); }
   .display:first-child { border-top: 0; }
-  .display .name { font-weight: 500; }
+  .display > input { grid-column: 1; grid-row: 1; }
+  .display .name { font-weight: 500; grid-column: 2; grid-row: 1; }
   .display .sub { grid-column: 2; color: var(--muted); font-size: .85rem; }
   .display .sub.bad { color: var(--amber); }
-  .display .ctl { display: flex; align-items: center; gap: .4rem; grid-row: 1 / span 2; }
-  .display select { padding: .35rem .5rem; background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 7px; font: inherit; font-size: .88rem; }
+  .display .ctl { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: .4rem; grid-column: 3; grid-row: 1 / span 2; }
+  label select { display: block; width: 100%; max-width: 34rem; margin-top: .3rem; padding: .55rem .65rem; background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 8px; font: inherit; }
   .display .ctl button { padding: .35rem .7rem; }
-  @media (max-width: 520px) { .display { grid-template-columns: auto 1fr; } .display .ctl { grid-row: auto; grid-column: 1 / -1; justify-content: flex-end; } }
+  @media (max-width: 640px) { .display { grid-template-columns: auto 1fr; } .display .ctl { grid-row: 3; grid-column: 1 / -1; justify-content: flex-end; } }
 
   /* scripts timeline: this IS a sequence, so the spine is earned */
   .timeline { position: relative; margin-left: .35rem; padding-left: 1.4rem; border-left: 2px solid var(--line); }
@@ -133,6 +135,7 @@
     <nav class="tabs" id="tabs">
       <a href="#overview">Overview</a>
       <a href="#displays">Displays</a>
+      <a href="#audio">Audio</a>
       <a href="#scripts">Scripts</a>
       <a href="#timing">Timing</a>
       <a href="#log">Log</a>
@@ -144,20 +147,40 @@
 
 <section id="overview">
   <h2>What's happening</h2>
-  <p class="lead">rpblank watches Steam for Remote Play sessions, darkens your screens while one runs, and runs your scripts around it. Windows never sleeps the desktop itself, so a stream always starts with a live picture.</p>
+  <p class="lead">rpblank watches Steam for Remote Play sessions. While one runs it switches your screens off, moves sound to the stream, and runs your scripts; afterwards it puts everything back.</p>
   <dl class="status-grid" id="status"></dl>
   <div class="actions">
-    <button id="blank-now">Blank now</button>
+    <button id="blank-now" title="Only works while Steam's virtual display exists">Screens off now</button>
     <button id="restore-now">Restore now</button>
-    <button id="idle-now" title="Darken the screens as the idle timer would, then move the mouse to wake them">Test idle blank</button>
   </div>
 </section>
 
 <section id="displays" hidden>
   <h2>Displays</h2>
-  <p class="lead">Tick a screen to darken it during sessions and after idle. Press Off, then On, before ticking: if the picture goes black but the backlight stays on, try the other off values. A screen that ignores all of them needs a command instead; see Scripts.</p>
+  <p class="lead">Tick the screens to switch off while a session runs. They lose signal for the session, the same way Moonlight with Vibeshine does it, and come back when it ends.</p>
+  <p class="help">This needs Steam's virtual display turned on (Steam → Settings → Remote Play), because the desktop has to live somewhere while your screens are off. The change is never saved to Windows, so a reboot or <strong>Restore now</strong> always brings the screens back. The Off button only works during a session.</p>
   <div id="display-list"></div>
   <div class="actions"><button id="rescan">Rescan</button></div>
+</section>
+
+<section id="audio" hidden>
+  <h2>Audio</h2>
+  <p class="lead">Which playback device Windows should use when a session starts and after it ends. Devices that are unplugged or whose screen is off are still listed.</p>
+  <form id="a">
+    <div class="group">
+      <h3>When a session connects</h3>
+      <p class="help">Set this to <strong>Steam Streaming Speakers</strong> so Steam captures a stable device from the first second.</p>
+      <label>Switch playback to<select name="audioConnect"></select></label>
+      <div class="actions"><button type="button" class="quiet" data-audio="audioConnect">Switch now</button></div>
+    </div>
+    <div class="group">
+      <h3>After the session ends</h3>
+      <p class="help">rpblank waits for the device to come back (a TV's audio returns a few seconds after its picture) and then switches. <strong>Previous device</strong> returns to whatever was playing before the session, unless you changed it yourself in the meantime.</p>
+      <label>Switch playback to<select name="audioDisconnect"></select></label>
+      <div class="actions"><button type="button" class="quiet" data-audio="audioDisconnect">Switch now</button></div>
+    </div>
+    <div class="actions"><button type="submit" class="primary">Save audio</button><button type="button" id="audio-rescan">Rescan</button></div>
+  </form>
 </section>
 
 <section id="scripts" hidden>
@@ -167,32 +190,28 @@
   <div class="timeline">
     <div class="step hook">
       <div class="row"><h3>Session detected</h3><button type="button" class="quiet" data-run="connect">Run now</button></div>
-      <p class="when">The instant Steam logs a client connecting, before anything else. Pin the audio device here so Steam captures a stable one.</p>
-      <textarea name="onConnect" spellcheck="false" placeholder='"C:\scripts\SoundVolumeView.exe" /SetDefault "Steam Streaming Speakers" all'></textarea>
-    </div>
-    <div class="step auto">
-      <h3>Wake and settle</h3>
-      <p class="when">rpblank wakes the display and waits for the link to come up.</p>
+      <p class="when">The instant Steam logs a client connecting. The connect audio device from the Audio tab is set first, then these run.</p>
+      <textarea name="onConnect" spellcheck="false"></textarea>
     </div>
     <div class="step hook">
       <div class="row"><h3>Screens darken</h3><button type="button" class="quiet" data-run="off">Run now</button></div>
-      <p class="when">Ticked displays are powered down over DDC. Add commands here for screens DDC can't reach, like a TV over HDMI-CEC or a smart plug. These also run for idle blanking.</p>
+      <p class="when">Ticked displays are switched off as soon as Steam's virtual display is up. Extra commands go here, for example a TV over HDMI-CEC or a smart plug.</p>
       <textarea name="offCommands" spellcheck="false" placeholder='"C:\Program Files\Pulse-Eight\cec-client.exe" -s -d 1 "standby 0"'></textarea>
     </div>
     <div class="step hook">
       <div class="row"><h3>Stream running</h3><button type="button" class="quiet" data-run="start">Run now</button></div>
-      <p class="when">Runs once the screens are dark.</p>
+      <p class="when">Runs once the session is under way.</p>
       <textarea name="onStart" spellcheck="false"></textarea>
     </div>
     <div class="step hook">
       <div class="row"><h3>Screens come back</h3><button type="button" class="quiet" data-run="on">Run now</button></div>
-      <p class="when">After the stream ends and the grace period passes, displays are powered on. The counterpart of the darken commands goes here.</p>
+      <p class="when">After the stream ends and the grace period passes, the screens are restored. The counterpart of the darken commands goes here.</p>
       <textarea name="onCommands" spellcheck="false" placeholder='"C:\Program Files\Pulse-Eight\cec-client.exe" -s -d 1 "on 0"'></textarea>
     </div>
     <div class="step hook">
       <div class="row"><h3>Stream over</h3><button type="button" class="quiet" data-run="stop">Run now</button></div>
-      <p class="when">Runs after the screens are back, plus the delay set under Timing. Audio back to the TV lives here.</p>
-      <textarea name="onStop" spellcheck="false" placeholder="C:\scripts\delayed_audio_switch.exe"></textarea>
+      <p class="when">Runs last: after the screens are back and the disconnect audio device from the Audio tab is set, plus the delay under Timing.</p>
+      <textarea name="onStop" spellcheck="false"></textarea>
     </div>
   </div>
   <div class="actions"><button type="submit" class="primary">Save scripts</button></div>
@@ -204,20 +223,13 @@
   <p class="lead">How long rpblank waits at each step, and which clients it acts for.</p>
   <form id="t">
     <div class="group">
-      <h3>Idle blanking</h3>
-      <p class="help">Replaces Windows' display sleep. Set Windows to <strong>Turn off display: Never</strong> and put your timeout here. The screens go dark after that long without keyboard or mouse input and wake on the next input. A running game, Big Picture with a game, a video, or a stream keeps them on, just as with Windows.</p>
-      <label>Blank after idle (minutes, 0 = off)<input type="number" name="idleBlankMin" min="0" max="1440"></label>
-    </div>
-    <div class="group">
       <h3>Around a session</h3>
       <div class="fields">
-        <label>Settle after wake (seconds)<input type="number" name="wakeSettleSec" min="0" max="60"></label>
         <label>Grace before restore (seconds)<input type="number" name="graceSec" min="0" max="3600"></label>
         <label>Delay before stop scripts (seconds)<input type="number" name="stopDelaySec" min="0" max="600"></label>
         <label>Command timeout (seconds)<input type="number" name="timeoutSec" min="0" max="3600"></label>
       </div>
-      <p class="help" style="margin-top:.75rem">Settle gives a woken monitor time to accept DDC. Grace absorbs the reconnects Steam does on a Wi‑Fi blip. The stop delay lets HDMI audio endpoints reappear before your audio script runs.</p>
-      <label class="check"><input type="checkbox" name="wakeDisplay"> Wake the display when a session starts</label>
+      <p class="help" style="margin-top:.75rem">Grace absorbs the reconnects Steam does on a Wi‑Fi blip and the gap when you close one game and start another; raise it if your screens flash on between games. The stop delay only applies to your stop scripts.</p>
     </div>
     <div class="group">
       <h3>Clients</h3>
@@ -254,7 +266,7 @@ const lines = (t) => t.split("\n").map((l) => l.trim()).filter(Boolean);
 const fmtTime = (t) => (t && !t.startsWith("0001") ? new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "never");
 
 /* ---- tabs ---- */
-const pages = ["overview", "displays", "scripts", "timing", "log"];
+const pages = ["overview", "displays", "audio", "scripts", "timing", "log"];
 function showTab(name) {
   if (!pages.includes(name)) name = "overview";
   for (const p of pages) $("#" + p).hidden = p !== name;
@@ -263,6 +275,7 @@ function showTab(name) {
   }
   try { localStorage.setItem("rpblank.tab", name); } catch (e) {}
   if (name === "displays") refreshDisplays();
+  if (name === "audio") refreshAudio();
   if (name === "log") refreshLog();
 }
 window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
@@ -274,8 +287,7 @@ async function loadConfig() {
   const f = $("#f"), t = $("#t");
   for (const k of ["onConnect", "offCommands", "onStart", "onCommands", "onStop"]) f[k].value = cfg[k].join("\n");
   t.clients.value = cfg.clients.join("\n");
-  for (const k of ["idleBlankMin", "wakeSettleSec", "graceSec", "stopDelaySec", "timeoutSec"]) t[k].value = cfg[k];
-  t.wakeDisplay.checked = cfg.wakeDisplay;
+  for (const k of ["graceSec", "stopDelaySec", "timeoutSec"]) t[k].value = cfg[k];
 }
 async function save(patch, okText) {
   try { cfg = await api("PUT", "/api/config", Object.assign({}, cfg, patch)); msg(okText); } catch (err) { msg(err.message); }
@@ -289,34 +301,74 @@ $("#f").onsubmit = (e) => {
 $("#t").onsubmit = (e) => {
   e.preventDefault();
   const t = e.target;
-  save({ clients: lines(t.clients.value), idleBlankMin: +t.idleBlankMin.value, wakeSettleSec: +t.wakeSettleSec.value,
-         graceSec: +t.graceSec.value, stopDelaySec: +t.stopDelaySec.value, timeoutSec: +t.timeoutSec.value,
-         wakeDisplay: t.wakeDisplay.checked }, "Timing saved");
+  save({ clients: lines(t.clients.value), graceSec: +t.graceSec.value, stopDelaySec: +t.stopDelaySec.value,
+         timeoutSec: +t.timeoutSec.value }, "Timing saved");
 };
 
 /* ---- displays ---- */
 function renderDisplays(list) {
+  // Saved ids are matched case-insensitively. Displays that are ticked but not active right
+  // now (switched off for a session, or unplugged) still get a row.
+  const saved = Object.entries(cfg.displays || {});
+  const keyFor = (id) => (saved.find(([k]) => k.toLowerCase() === id.toLowerCase()) || [id])[0];
+  const seen = new Set(list.map((d) => d.id.toLowerCase()));
+  for (const [id, sv] of saved) {
+    if (!seen.has(id.toLowerCase()) && sv.blank) {
+      const m = id.match(/#([^#]+)#/);
+      list = list.concat([{ id, name: m ? m[1] : id, missing: true }]);
+    }
+  }
   const rows = list.map((d) => {
-    const saved = (cfg.displays || {})[d.id] || { id: d.id, blank: false, offValue: 0 };
+    const key = keyFor(d.id);
+    const sv = (cfg.displays || {})[key] || { blank: false };
     const row = el("div", "", { className: "display" });
-    const box = el("input", "", { type: "checkbox", checked: saved.blank, title: "Darken during sessions and idle" });
+    const box = el("input", "", { type: "checkbox", checked: !!sv.blank && !d.virtual, disabled: !!d.virtual, title: "Switch off during sessions" });
     const name = el("div", d.name, { className: "name" });
-    const sub = el("div", d.device + (d.ddc && !d.err ? `, DDC ok, power ${d.power}` : `, ${d.err || "DDC unverified"}`), { className: "sub" + (d.ddc ? "" : " bad") });
+    const code = (d.id.match(/#([^#]+)#/) || [])[1] || "";
+    const sub = el("div", d.missing ? "not active right now (switched off for a session, or unplugged)"
+      : d.virtual ? "virtual display; this is where the stream is rendered, so it stays on"
+      : code, { className: "sub" + (d.missing ? " bad" : "") });
     const ctl = el("div", "", { className: "ctl" });
-    const sel = el("select", "", { title: "Which DDC power value to send" });
-    for (const [v, t] of [[4, "off = 4"], [5, "off = 5"], [2, "off = 2"], [3, "off = 3"]]) sel.append(el("option", t, { value: v, selected: (saved.offValue || 4) == v }));
-    const persist = () => save({ displays: Object.assign({}, cfg.displays, { [d.id]: { id: d.id, blank: box.checked, offValue: +sel.value } }) }, box.checked ? `${d.name} will be darkened` : `${d.name} left alone`);
-    box.onchange = persist; sel.onchange = persist;
-    const off = el("button", "Off", { onclick: async () => { try { await api("POST", "/api/displays/power", { id: d.id, value: +sel.value }); msg("Off sent to " + d.name); } catch (e) { msg(e.message); } } });
-    const on = el("button", "On", { onclick: async () => { try { await api("POST", "/api/displays/power", { id: d.id, value: 1 }); msg("On sent to " + d.name); } catch (e) { msg(e.message); } } });
-    ctl.append(sel, off, on);
+    box.onchange = () => save({ displays: Object.assign({}, cfg.displays, { [key]: { id: key, blank: box.checked } }) },
+      box.checked ? `${d.name} will be switched off during sessions` : `${d.name} left on`);
+    const send = async (on, label) => { try { await api("POST", "/api/displays/power", { id: d.id, on }); msg(label + " sent to " + d.name); setTimeout(refreshDisplays, 1500); } catch (e) { msg(e.message); } };
+    if (!d.virtual) ctl.append(el("button", "Off", { onclick: () => send(false, "Off") }), el("button", "On", { onclick: () => send(true, "On") }));
     row.append(box, name, ctl, sub);
     return row;
   });
-  $("#display-list").replaceChildren(...(rows.length ? rows : [el("div", "No displays found. Is a monitor connected and on?", { className: "empty" })]));
+  $("#display-list").replaceChildren(...(rows.length ? rows : [el("div", "No displays found. Is a screen connected and on?", { className: "empty" })]));
 }
 async function refreshDisplays() { try { renderDisplays(await api("GET", "/api/displays")); } catch (err) { msg(err.message); } }
 $("#rescan").onclick = refreshDisplays;
+
+/* ---- audio ---- */
+let audioDevs = [];
+function fillAudio(sel, value, savedName, extra) {
+  const opts = extra.slice();
+  for (const d of audioDevs) opts.push([d.id, d.name + (d.active ? "" : ` (${d.state})`) + (d.default ? " — current default" : "")]);
+  if (value && !opts.some(([v]) => v === value)) opts.push([value, (savedName || value) + " (not found)"]);
+  sel.replaceChildren(...opts.map(([v, t]) => el("option", t, { value: v, selected: v === (value || "") })));
+}
+function renderAudio() {
+  const a = $("#a");
+  fillAudio(a.audioConnect, cfg.audioConnect, cfg.audioConnectName, [["", "Leave audio alone"]]);
+  fillAudio(a.audioDisconnect, cfg.audioDisconnect, cfg.audioDisconnectName, [["", "Leave audio alone"], ["previous", "Previous device (from before the session)"]]);
+}
+async function refreshAudio() { try { audioDevs = await api("GET", "/api/audio"); renderAudio(); } catch (err) { msg(err.message); } }
+const audioName = (id) => (audioDevs.find((d) => d.id === id) || {}).name || "";
+$("#a").onsubmit = (e) => {
+  e.preventDefault();
+  const a = e.target;
+  save({ audioConnect: a.audioConnect.value, audioConnectName: audioName(a.audioConnect.value),
+         audioDisconnect: a.audioDisconnect.value, audioDisconnectName: audioName(a.audioDisconnect.value) }, "Audio saved");
+};
+$("#audio-rescan").onclick = refreshAudio;
+for (const b of document.querySelectorAll("button[data-audio]"))
+  b.onclick = async () => {
+    const id = $("#a")[b.dataset.audio].value;
+    if (!id || id === "previous") { msg("Pick a specific device to test"); return; }
+    try { await api("POST", "/api/audio/default", { id }); msg("Playback switched to " + audioName(id)); } catch (err) { msg(err.message); }
+  };
 
 /* ---- status ---- */
 async function refreshStatus() {
@@ -325,18 +377,16 @@ async function refreshStatus() {
     const st = s.session;
     const mon = $("#mon");
     mon.className = "monitor " + (st.active ? "blanked session" : st.blanked ? "blanked" : "lit");
-    let line;
-    if (st.active) line = `Streaming to <strong>${st.client}</strong>, screens dark`;
-    else if (st.restoring) line = "Stream ended, screens come back shortly";
-    else if (st.idleBlank) line = "Idle, screens dark until you touch the mouse or keyboard";
-    else if (st.blanked) line = "Screens dark, waiting for Restore";
-    else line = "Watching for a Remote Play session, screens on";
-    $("#state").innerHTML = line;
+    const state = $("#state");
+    if (st.active) state.replaceChildren("Streaming to ", el("strong", st.client), ", screens off");
+    else if (st.restoring) state.textContent = "Stream ended, screens come back shortly";
+    else if (st.blanked) state.textContent = "Screens off, waiting for Restore";
+    else state.textContent = "Watching for a Remote Play session, screens on";
     $("#meta").textContent = `version ${s.version}, running ${s.uptime}`;
     const dl = $("#status");
     const item = (k, v) => { const d = el("div"); d.append(el("dt", k), el("dd", v)); return d; };
     dl.replaceChildren(
-      item("Screens", st.blanked ? (st.idleBlank ? "dark (idle)" : "dark") : "on"),
+      item("Screens", st.blanked ? "off" : "on"),
       item("Last session started", fmtTime(st.lastStart)),
       item("Last session ended", fmtTime(st.lastStop)),
       item("Last action", st.lastAction || "none yet"),
@@ -347,12 +397,8 @@ async function refreshLog() { try { $("#logbox").textContent = (await api("GET",
 $("#log-refresh").onclick = refreshLog;
 
 /* ---- actions ---- */
-$("#blank-now").onclick = async () => { await api("POST", "/api/blank"); msg("Blanking"); };
+$("#blank-now").onclick = async () => { await api("POST", "/api/blank"); msg("Switching screens off; see Log if nothing happens"); };
 $("#restore-now").onclick = async () => { await api("POST", "/api/restore"); msg("Restoring"); };
-$("#idle-now").onclick = async () => {
-  const r = await api("POST", "/api/idle-blank");
-  msg(r.ok ? "Screens darkened. Wait 3 seconds, then move the mouse." : "Can't right now: a session is active or screens are already dark");
-};
 for (const b of document.querySelectorAll("button[data-run]"))
   b.onclick = async () => {
     const ev = b.dataset.run;

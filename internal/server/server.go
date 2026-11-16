@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"rpblank/internal/audio"
 	"rpblank/internal/config"
 	"rpblank/internal/display"
 	"rpblank/internal/hooks"
@@ -24,6 +25,7 @@ var webFS embed.FS
 type Server struct {
 	cfg     *config.Store
 	disp    display.Backend
+	aud     audio.Backend
 	sess    *session.Controller
 	hooks   *hooks.Runner
 	logPath string
@@ -32,8 +34,8 @@ type Server struct {
 	started time.Time
 }
 
-func New(cfg *config.Store, disp display.Backend, sess *session.Controller, hk *hooks.Runner, logFile, version string) http.Handler {
-	s := &Server{cfg: cfg, disp: disp, sess: sess, hooks: hk, logFile: logFile, version: version, started: time.Now()}
+func New(cfg *config.Store, disp display.Backend, aud audio.Backend, sess *session.Controller, hk *hooks.Runner, logFile, version string) http.Handler {
+	s := &Server{cfg: cfg, disp: disp, aud: aud, sess: sess, hooks: hk, logFile: logFile, version: version, started: time.Now()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.status)
 	mux.HandleFunc("GET /api/config", s.getConfig)
@@ -48,9 +50,8 @@ func New(cfg *config.Store, disp display.Backend, sess *session.Controller, hk *
 		go s.sess.Restore()
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	})
-	mux.HandleFunc("POST /api/idle-blank", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, 200, map[string]bool{"ok": s.sess.IdleBlankNow()})
-	})
+	mux.HandleFunc("GET /api/audio", s.audioList)
+	mux.HandleFunc("POST /api/audio/default", s.audioSet)
 	mux.HandleFunc("POST /api/hooks/run", s.runHooks)
 	mux.HandleFunc("GET /api/log", s.log)
 	sub, _ := fs.Sub(webFS, "web")
@@ -123,23 +124,59 @@ func (s *Server) displays(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, list)
 }
 
+// power is the Displays tab's Off/On test: switch one output off, or restore the layout.
 func (s *Server) power(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID    string `json:"id"`
-		Value uint32 `json:"value"`
+		ID string `json:"id"`
+		On bool   `json:"on"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	if body.Value < 1 || body.Value > 5 {
-		writeErr(w, 400, errors.New("value must be 1–5"))
+	var err error
+	if body.On {
+		err = s.disp.RestoreOutputs()
+	} else {
+		err = s.disp.DisableOutputs([]string{body.ID})
+	}
+	if errors.Is(err, display.ErrNoOtherDisplay) {
+		writeErr(w, 409, errors.New("No other active display: a screen can only be switched off while Steam's virtual display exists, so try this during a session."))
 		return
 	}
-	if body.Value == display.PowerOn {
-		_ = s.disp.Wake() // the link must be up for DDC to reach the panel
+	if err != nil {
+		writeErr(w, 500, err)
+		return
 	}
-	err := display.SetPowerRetry(s.disp, body.ID, body.Value)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) audioList(w http.ResponseWriter, _ *http.Request) {
+	list, err := s.aud.List()
+	if err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	if list == nil {
+		list = []audio.Device{}
+	}
+	writeJSON(w, 200, list)
+}
+
+// audioSet is the Audio tab's "Switch now" test.
+func (s *Server) audioSet(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&body); err != nil || body.ID == "" {
+		writeErr(w, 400, errors.New("id required"))
+		return
+	}
+	err := s.aud.SetDefault(body.ID)
+	if errors.Is(err, audio.ErrNotActive) {
+		writeErr(w, 409, errors.New("That device isn't active right now (unplugged, or its screen is off)."))
+		return
+	}
 	if err != nil {
 		writeErr(w, 500, err)
 		return

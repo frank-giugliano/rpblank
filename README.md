@@ -1,122 +1,120 @@
 # rpblank
 
-**Dark screens while you Steam Remote Play. Nothing else touched.**
+**Screens off and sound in the right place while you Steam Remote Play.**
 
-rpblank is a small background tool (Windows, no tray icon, no installer) for a couch-gaming PC. When a
-Steam Remote Play client connects, it blanks the physical monitor(s) over DDC/CI so
-nobody in the room sees what you're streaming, runs your scripts (audio switching,
-HDMI-CEC, whatever), and puts everything back when the session ends.
+rpblank is a small background tool (Windows, no tray icon, no installer) for a
+couch-gaming PC. When a Steam Remote Play client connects, it switches the physical
+screens off so nobody in the room sees what you're streaming, moves the default audio
+device to the stream, and runs your scripts. When the session ends it puts everything
+back.
 
-It is one static binary with a local web UI. No driver, no virtual display, no
-`SetDisplayConfig`, no saved display layouts. That last part is the point: tools that
-rearrange the display topology to hide a screen can leave Windows with a broken
-layout and break other streaming hosts (Sunshine/Vibeshine). rpblank never changes
-what Windows thinks is plugged in; it only tells the panel to go dark.
+It is one static binary with a local web UI and no driver of its own.
 
 ```
-Steam logs "Streaming started"  ─►  connect scripts ─► wake ─► DDC off ─► start scripts
-Steam logs "Encoding complete"  ─►  grace period ─► DDC on ─► stop scripts
+Steam logs "Streaming started"  ─►  audio → stream device ─► connect scripts
+                                    ─► screens off (once Steam's virtual display is up) ─► start scripts
+Steam logs "Encoding complete"  ─►  grace period ─► screens restored ─► audio → speakers/TV ─► stop scripts
 ```
 
 ## Requirements
 
-- Windows 10/11 and Steam (any Remote Play client on the other end).
-- A monitor that answers DDC/CI. Most do; check it's enabled in the OSD. Displays that
-  don't can still be blanked with a command (HDMI-CEC, smart plug, …).
-- **Optional:** Steam's virtual display (the SudoVDA driver). rpblank does not need it and
-  does not interact with it. You want it anyway if you run games in borderless window:
-  the desktop then becomes the client's resolution for the session (e.g. 1280×800 for a
-  Deck) instead of rendering at your monitor's native resolution and downscaling. With it
-  on, Steam may disable the physical output for the session; rpblank's DDC commands then
-  fail harmlessly (`I2C` lines in the log) and it restores normally once Steam hands the
-  display back.
+- Windows 10/11 and Steam, with any Remote Play client on the other end.
+- **Steam's virtual display** (the SudoVDA driver; Steam → Settings → Remote Play). The
+  desktop has to live somewhere while your screens are off, and Windows will not switch
+  off its only display. This is also what makes the stream render at the client's
+  resolution instead of your monitor's.
 
 ## Features
 
 - **Detects sessions from Steam itself.** Tails `Steam\logs\streaming_log.txt`; no Steam
-  integration, pairing or client-side plugin needed. Works with any Remote Play client
-  (Steam Deck, Steam Link, phones, Fire TV).
-- **Blanks over DDC/CI (VCP 0xD6).** Per-display on/off with a selectable off value
-  (standby or power-off). Displays without DDC can be blanked by command instead.
-- **Script hooks.** `On connect`, `On start`, `On stop`, plus extra blank/restore commands.
-  Paths to `.exe`, `.ps1`, `.cmd`/`.bat` with arguments; no console windows flash; output
-  goes to `hooks.log`. Each hook has a **Run now** button.
-- **Idle blanking.** Replaces Windows' "turn off display after N minutes". Steam creates its
-  capture the instant a client connects; if Windows has the display asleep right then, the
-  stream is black until you reconnect. With rpblank owning display sleep the desktop never
-  actually sleeps, so a cold-start session always captures a live screen. Idle blanking is
-  skipped while a game or player holds the display awake (`ES_DISPLAY_REQUIRED`).
-- **Safe by default.** Grace period so switching games doesn't flash the monitor; wake +
-  settle before any DDC command; retries while the link is down; restores on next start if
-  it was killed while blanked; `-restore` escape hatch from a shell.
-- **Coexists with Vibeshine / Sunshine / Moonlight.** It never fights over the displays, and
-  if a Vibeshine session takes the physical outputs away mid-restore it just retries until
-  they're back.
-- **Web UI** at `http://127.0.0.1:47996/` — Overview, Displays, Scripts, Timing, Log.
-  Loopback only by default.
+  integration, pairing or client-side plugin. Works with any Remote Play client (Steam
+  Deck, Steam Link, phones, Fire TV).
+- **Switches screens off for the session.** Ticked displays are taken out of the active
+  Windows layout once Steam's virtual display exists, so they show "no signal", the same
+  way Sunshine/Vibeshine with a virtual display behaves. Works on monitors and TVs alike.
+  The change is applied without being saved to Windows' display database, so a reboot or
+  `rpblank.exe -restore` always returns to your own layout.
+- **Audio switching built in.** Pick the playback device for "session connects" (normally
+  Steam Streaming Speakers) and for "session ends" (a specific device, or whatever was
+  default before). After a session rpblank waits for the device to come back, since a
+  TV's HDMI audio reappears a few seconds after its picture, and then switches all three
+  Windows roles. Devices are stored by endpoint id, so renames and driver updates don't
+  break it.
+- **Script hooks.** `On connect`, `On start`, `On stop`, plus extra darken/restore
+  commands (HDMI-CEC, a smart plug). Paths to `.exe`, `.ps1`, `.cmd`/`.bat` with
+  arguments; no console windows flash; output goes to `hooks.log`. Each has **Run now**.
+- **Grace period.** Closing one game and starting another, or a Wi-Fi reconnect, inside
+  the grace window is treated as one session: no restore, no stop scripts.
+- **Recovers.** If rpblank is killed mid-session it restores screens and audio on its next
+  start.
+- **Web UI** at `http://127.0.0.1:47996/`: Overview, Displays, Audio, Scripts, Timing,
+  Log. Loopback only by default.
 
 ## Install
 
-1. Grab `rpblank.exe` and `install.ps1` from [Releases](../../releases) (or build, below)
-   into a folder of their own, e.g. `C:\tools\rpblank\`. Config, state and logs live there.
+1. Grab `rpblank.exe` from [Releases](../../releases) (or build, below) into a folder of
+   its own, e.g. `C:\tools\rpblank\`. Config, state and logs live there.
 2. Run `rpblank.exe` once. It writes `rpblank.json` with defaults and opens the web UI.
    (Unsigned: SmartScreen → More info → Run anyway.)
-3. **Displays** tab: click **Off** then **On** on each display to confirm the panel obeys
-   DDC, then tick the ones to blank. If "off = 4" (standby) doesn't blank it, try 5; if 5
-   won't come back on, use 4.
-4. **Scripts** tab: add what you need (examples below). Save.
-5. **Timing** tab: set **Blank after idle** to the minutes you had in Windows, then set
-   Windows → Settings → System → Power → *Turn off display* to **Never**.
-6. Start at logon: `powershell -ExecutionPolicy Bypass -File install.ps1`. This registers
-   a hidden scheduled task running as you. `install.ps1 -Uninstall` removes it.
+3. **Displays** tab: tick the screens to switch off during sessions.
+4. **Audio** tab: set the connect device to *Steam Streaming Speakers* and choose what to
+   return to afterwards. Save.
+5. Start it at logon (next section).
 
 Only one instance runs; launching the exe again just opens the web page.
 
-## Example scripts
+### Start at logon, without opening the browser
 
-Pin Steam's audio before it captures (On connect), using
-[SoundVolumeView](https://www.nirsoft.net/utils/sound_volume_view.html):
-
-```
-"C:\tools\SoundVolumeView.exe" /SetDefault "Steam Streaming Speakers" all
-```
-
-Switch back to the TV after the stream (On stop):
+Run by hand, rpblank opens its web page. At startup you don't want that, so start it with
+`-open=false`:
 
 ```
-"C:\tools\SoundVolumeView.exe" /SetDefault "NVIDIA High Definition Audio\Device\LG TV" all
+C:\tools\rpblank\rpblank.exe -open=false
 ```
 
-Put a TV in standby over HDMI-CEC with a Pulse-Eight adapter (Extra blank commands):
+1. Right-click `rpblank.exe` → **Create shortcut**.
+2. Right-click the shortcut → **Properties** → in **Target**, add a space and `-open=false`
+   after the path, as above. (If the path has spaces, keep the quotes around the path and
+   put the argument after the closing quote.)
+3. Press `Win+R`, enter `shell:startup`, and move the shortcut into that folder.
 
-```
-"C:\Program Files (x86)\Pulse-Eight\USB-CEC Adapter\cec-client.exe" -s -d 1 "standby 0"
-```
+The UI is always available at <http://127.0.0.1:47996/>.
 
-Scripts get `RPBLANK_EVENT` (`connect`/`start`/`stop`/`off`/`on`) and `RPBLANK_CLIENT`
-(the client name Steam logged) in their environment. Commands run in order, each with the
-configured timeout; a hung one is killed and the next runs.
+Idle screen-off is left to Windows: keep your normal "Turn my screen off after" setting.
+With Steam's virtual display on, a session that starts while the screen is asleep still
+comes up with picture.
 
 ## Timing settings
 
 | Setting | Default | What it does |
 |---|---|---|
-| Blank after idle | 0 (off) | Minutes without keyboard/mouse input before blanking. Any input restores. |
-| Wake display | on | Jiggle the mouse / send monitor-on before DDC commands so the link is up. |
-| Wake settle | 6 s | Wait after waking before talking DDC. Raise if your panel is slow to come back. |
-| Grace before restore | 20 s | A new session inside this window is a resume: no restore, no stop scripts. Raise (60–120) if you browse the library between games. |
-| Delay before stop scripts | 3 s | Time between displays coming back and On stop running. |
+| Grace before restore | 20 s | A new session inside this window is a resume. Raise it (60–120) if you browse the library between games. |
+| Delay before stop scripts | 3 s | Time between the restore and your On stop commands. |
 | Script timeout | 60 s | Per command. |
 | Clients | (all) | Only react to these client names (as Steam logs them). |
+
+Screens come back when the grace period ends, though Windows usually re-enables them by
+itself the moment Steam removes its virtual display, so they may light up earlier.
+
+## Scripts
+
+Scripts get `RPBLANK_EVENT` (`connect`/`start`/`stop`/`off`/`on`) and `RPBLANK_CLIENT`
+(the client name Steam logged) in their environment. Commands run in order, each with the
+configured timeout; a hung one is killed and the next runs. Example, a TV in standby over
+HDMI-CEC with a Pulse-Eight adapter (Screens darken):
+
+```
+"C:\Program Files (x86)\Pulse-Eight\USB-CEC Adapter\cec-client.exe" -s -d 1 "standby 0"
+```
 
 ## Command line
 
 ```
 rpblank.exe              start (opens the UI if run by hand)
 rpblank.exe -open=false  start without opening the browser
-rpblank.exe -blank       blank configured displays now and exit
-rpblank.exe -restore     restore them now and exit
-rpblank.exe -list        list displays and DDC support
+rpblank.exe -restore     restore screens and audio now and exit
+rpblank.exe -blank       switch the ticked screens off now (needs a virtual display)
+rpblank.exe -list        list displays and playback devices
 rpblank.exe -dir PATH    use PATH for config/state/logs (default: next to the exe)
 ```
 
@@ -130,10 +128,11 @@ All JSON, loopback only unless `listen` in `rpblank.json` is changed (there is n
 |---|---|---|
 | GET | `/api/status` | version, uptime, session state |
 | GET / PUT | `/api/config` | the config file |
-| GET | `/api/displays` | enumerated displays with DDC status |
-| POST | `/api/displays/power` | `{"id": "...", "value": 1-5}` |
-| POST | `/api/blank` · `/api/restore` | manual blank / restore |
-| POST | `/api/idle-blank` | trigger an idle blank now (for testing) |
+| GET | `/api/displays` | active outputs |
+| POST | `/api/displays/power` | `{"id": "...", "on": false}` switch one output off / restore |
+| GET | `/api/audio` | playback devices, all states |
+| POST | `/api/audio/default` | `{"id": "..."}` set the default playback device |
+| POST | `/api/blank` · `/api/restore` | manual screens off / restore |
 | POST | `/api/hooks/run` | `{"event": "connect|start|stop|off|on"}` |
 | GET | `/api/log` | last 80 lines of `rpblank.log` |
 
@@ -143,34 +142,37 @@ Go 1.23+, no cgo, no Windows SDK needed; cross-compiles from anywhere.
 
 ```sh
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
-  go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.2.1" \
+  go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.4.0" \
   -o rpblank.exe ./cmd/rpblank
 
 # console variant (drop -H=windowsgui)
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
-  go build -trimpath -ldflags "-s -w -X main.version=0.2.1" \
+  go build -trimpath -ldflags "-s -w -X main.version=0.4.0" \
   -o rpblank-console.exe ./cmd/rpblank
 
 go test ./...
 ```
 
-On non-Windows hosts it runs with a fake display backend so the UI and session logic can
-be exercised; the Windows-only parts are the DDC/CI calls (`dxva2.dll`), input/idle
-(`user32.dll`) and the power-state query (`powrprof.dll`).
+On non-Windows hosts it runs with fake display and audio backends so the UI and session
+logic can be exercised.
 
 ## How it works
 
 - **Detection** — `internal/steamlog` tails Steam's `streaming_log.txt` from the end,
   tolerating rotation, and emits start/stop events for `Streaming started to <client>` and
   `Encoding complete`.
-- **Displays** — `internal/display` enumerates monitors with `EnumDisplayMonitors` /
-  `GetPhysicalMonitorsFromHMONITOR`, gives each a stable device-interface ID, and sends
-  `SetVCPFeature(0xD6, value)`. Wake is a 1‑px `SendInput` mouse move plus
-  `SC_MONITORPOWER -1`. Idle is `GetLastInputInfo`; `CallNtPowerInformation
-  (SystemExecutionState)` tells it whether something is holding the display awake.
-- **Session** — `internal/session` is the state machine: connect hooks → wake → settle →
-  blank → start hooks; stop → grace → wake → restore (with retry) → stop hooks; plus the
-  idle loop and a `blanked.state` file for crash recovery.
+- **Displays** — `internal/display` reads the active paths with `QueryDisplayConfig`,
+  waits until there is another active display besides the ticked ones, then applies the
+  same layout minus those paths with `SetDisplayConfig`, without `SDC_SAVE_TO_DATABASE`.
+  It re-checks twice over the next few seconds in case Steam re-applies its own layout.
+  Restore re-applies the captured layout, or `SDC_USE_DATABASE_CURRENT` if the virtual
+  display is already gone.
+- **Audio** — `internal/audio` enumerates render endpoints through the MMDevice API and
+  sets the default with `IPolicyConfig::SetDefaultEndpoint` (undocumented, but stable since
+  Windows 7 and used by every audio switcher). COM is called directly through vtables, so
+  there is no cgo and no extra dependency.
+- **Session** — `internal/session` is the state machine, with a `blanked.state` file (and
+  the remembered audio device beside it) for crash recovery.
 - **Hooks** — `internal/hooks` splits command lines shell-style, picks the interpreter by
   extension, hides windows, and writes output to `hooks.log` so a hook that spawns a
   detached child isn't counted as hung.
@@ -178,14 +180,12 @@ be exercised; the Windows-only parts are the DDC/CI calls (`dxva2.dll`), input/i
 
 ## Notes and limits
 
-- DDC/CI must be enabled in the monitor's OSD (it usually is). A panel that is "no signal"
-  or DPMS-asleep won't answer on the I²C bus; that's why rpblank wakes first and retries.
-- Some monitors drop off the DisplayPort bus when put in DDC power-off, which Windows sees
-  as an unplug. HDMI generally stays connected. If your layout shuffles when blanking, use
-  standby (4) or a CEC/plug route for that screen.
-- A session starting while already idle-blanked keeps the panel dark and skips the wake.
-- Windows only. Steam on Linux doesn't use the same log format and DDC there is `ddcutil`
-  territory; patches welcome.
+- If no virtual display appears within 20 s of a session starting, rpblank logs that and
+  leaves the screens on.
+- Don't run it alongside another tool that rewrites the display layout for the same
+  session. Sunshine/Vibeshine are fine as long as a Moonlight session and a Steam session
+  aren't both active at once.
+- Windows only.
 
 ## License
 

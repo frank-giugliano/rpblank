@@ -1,81 +1,33 @@
-// Package display enumerates physical monitors and powers them off/on over DDC/CI (VCP D6).
-// Nothing here changes the Windows display topology.
+// Package display lists the active Windows outputs and takes chosen ones out of the active
+// layout for the length of a Remote Play session, the way a streaming host with a virtual
+// display does. The change is never saved to Windows' display database.
 package display
 
-import (
-	"errors"
-	"time"
-)
+import "errors"
 
-// VCP code D6: power mode. 1 = on, 4 = off (standby/suspend), 5 = power off (some panels).
-const (
-	VCPPower        = 0xD6
-	PowerOn  uint32 = 1
-	PowerOff uint32 = 4
-)
-
-// Info describes one physical monitor.
+// Info describes one active output.
 type Info struct {
-	ID     string `json:"id"`     // stable device path
-	Name   string `json:"name"`   // monitor model from EDID, or the GDI name
-	Device string `json:"device"` // \\.\DISPLAYn
-	DDC    bool   `json:"ddc"`    // answered a VCP capabilities/D6 read
-	Power  int    `json:"power"`  // last read D6 value, 0 if unknown
-	Err    string `json:"err,omitempty"`
+	ID      string `json:"id"`      // monitor device interface path (stable)
+	Name    string `json:"name"`    // monitor name from EDID, where there is one
+	Virtual bool   `json:"virtual"` // an indirect (virtual) display such as Steam's
 }
-
-var ErrNotSupported = errors.New("DDC/CI not supported on this platform")
 
 // Backend is the OS layer.
 type Backend interface {
-	// List enumerates monitors and probes DDC on each.
+	// List returns the outputs that are active right now.
 	List() ([]Info, error)
-	// SetPower sends VCP D6 = value to the monitor with this id.
-	SetPower(id string, value uint32) error
-	// Wake nudges the OS so a sleeping display turns on (synthetic input).
-	Wake() error
-	// ReadPower returns the current D6 value and whether the panel answered.
-	ReadPower(id string) (int, bool)
-	// IdleSeconds is the time since the last user input, and whether it could be read.
-	IdleSeconds() (float64, bool)
-	// DisplayRequired reports whether any process is holding the display awake
-	// (ES_DISPLAY_REQUIRED): a running game, Big Picture, a video player, a stream host.
-	DisplayRequired() bool
+	// DisableOutputs deactivates the outputs driving these displays: the panels lose
+	// signal. It needs some other active display (Steam's virtual one) to keep the desktop
+	// on; without one it returns ErrNoOtherDisplay and changes nothing. Displays that are
+	// already inactive are skipped.
+	DisableOutputs(ids []string) error
+	// RestoreOutputs undoes DisableOutputs: the layout captured before the change if it
+	// still applies, otherwise Windows' saved layout for the displays now connected.
+	RestoreOutputs() error
 }
+
+// ErrNoOtherDisplay: disabling the requested outputs would leave Windows with no display.
+var ErrNoOtherDisplay = errors.New("no other active display to keep the desktop on")
 
 // New returns the backend for this OS.
 func New() Backend { return newBackend() }
-
-// WakeRetries / WakeInterval: a panel coming out of hard-off may ignore the first On
-// commands while its DDC listener restarts, so PowerOn is retried.
-const (
-	WakeRetries  = 5
-	WakeInterval = 2 * time.Second
-)
-
-// SetPowerRetry sends D6=value repeatedly until a send succeeds, retrying I2C failures
-// (no signal on the link yet, typically right after a wake) and, for PowerOn, until a
-// follow-up read (where the panel supports reads) no longer reports it off.
-func SetPowerRetry(b Backend, id string, value uint32) error {
-	var last error
-	for i := 0; i < WakeRetries; i++ {
-		if i > 0 {
-			time.Sleep(WakeInterval)
-		}
-		if err := b.SetPower(id, value); err != nil {
-			last = err
-			continue
-		}
-		last = nil
-		if value != PowerOn {
-			return nil
-		}
-		if p, ok := b.ReadPower(id); !ok || p == int(PowerOn) {
-			return nil
-		}
-	}
-	return last
-}
-
-// SetPowerOn is SetPowerRetry with PowerOn.
-func SetPowerOn(b Backend, id string) error { return SetPowerRetry(b, id, PowerOn) }

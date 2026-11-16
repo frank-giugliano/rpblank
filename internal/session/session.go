@@ -1,20 +1,25 @@
-// Package session turns Remote Play start/stop events into blank/restore actions.
+// Package session turns Remote Play start/stop events into actions.
 //
-// Start: optional wake → blank each selected display (DDC D6) → off-commands → on-start hooks.
-// Stop:  wait the grace period (a start during it cancels) → restore displays → on-commands
+// Start: switch audio → connect hooks → switch the ticked outputs off once Steam's virtual
 //
-//	→ wait the stop delay → on-stop hooks.
+//	display exists → darken commands → start hooks.
 //
-// A small state file records that displays are blanked so a crash or restart can restore them.
+// Stop:  wait the grace period (a start during it cancels) → restore outputs → restore
+//
+//	commands → switch audio back → wait the stop delay → stop hooks.
+//
+// A small state file records that outputs are off so a crash or restart can restore them.
 package session
 
 import (
+	"errors"
 	"log"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"rpblank/internal/audio"
 	"rpblank/internal/config"
 	"rpblank/internal/display"
 	"rpblank/internal/hooks"
@@ -22,35 +27,35 @@ import (
 
 // Status is what the UI shows.
 type Status struct {
-	Active    bool `json:"active"`
-	IdleBlank bool `json:"idleBlank"` // blanked by the idle timer rather than a session
-	// RestorePending: an "on" failed for lack of a display link; the idle loop keeps retrying.
-	RestorePending bool      `json:"restorePending"`
-	Client         string    `json:"client"`
-	Blanked        bool      `json:"blanked"`
-	Restoring      bool      `json:"restoring"` // in the grace period
-	LastStart      time.Time `json:"lastStart"`
-	LastStop       time.Time `json:"lastStop"`
-	LastAction     string    `json:"lastAction"`
+	Active     bool      `json:"active"`
+	Client     string    `json:"client"`
+	Blanked    bool      `json:"blanked"`
+	Restoring  bool      `json:"restoring"` // in the grace period
+	LastStart  time.Time `json:"lastStart"`
+	LastStop   time.Time `json:"lastStop"`
+	LastAction string    `json:"lastAction"`
 }
 
 type Controller struct {
 	cfg   *config.Store
 	disp  display.Backend
+	aud   audio.Backend
 	hooks *hooks.Runner
-	state string // path of the blanked-marker file
+	state string // path of the blanked-marker file; state+".audio" holds the previous device
 
 	mu        sync.Mutex
 	st        Status
 	timer     *time.Timer
-	blankedAt time.Time // when the idle blank happened; input within 3 s of it is ignored
-	ignored   string    // client name skipped by the filter, for the log
+	prevAudio string // default playback device from before the session
 }
 
-func New(cfg *config.Store, disp display.Backend, hk *hooks.Runner, statePath string) *Controller {
-	c := &Controller{cfg: cfg, disp: disp, hooks: hk, state: statePath}
+func New(cfg *config.Store, disp display.Backend, aud audio.Backend, hk *hooks.Runner, statePath string) *Controller {
+	c := &Controller{cfg: cfg, disp: disp, aud: aud, hooks: hk, state: statePath}
+	if b, err := os.ReadFile(statePath + ".audio"); err == nil {
+		c.prevAudio = strings.TrimSpace(string(b))
+	}
 	if _, err := os.Stat(statePath); err == nil {
-		log.Println("displays were left blanked by a previous run; restoring")
+		log.Println("screens were left off by a previous run; restoring")
 		c.restore("recovery")
 	}
 	return c
@@ -81,7 +86,7 @@ func (c *Controller) Start(client string) {
 	if c.timer != nil {
 		c.timer.Stop()
 		c.timer = nil
-		log.Printf("session resumed by %q before restore; keeping displays blanked", client)
+		log.Printf("session resumed by %q before restore; keeping screens off", client)
 	}
 	alreadyBlanked := c.st.Blanked
 	c.st.Active, c.st.Client, c.st.Restoring, c.st.LastStart = true, client, false, time.Now()
@@ -91,106 +96,23 @@ func (c *Controller) Start(client string) {
 		log.Printf("session from %q ignored (not in client list)", client)
 		return
 	}
-	// Connect commands fire first and synchronously: pinning the audio device has to beat
-	// Steam opening its capture, which happens within a second or two of this log line.
-	if cfg := c.cfg.Get(); len(cfg.OnConnect) > 0 {
+	// Audio and the connect commands go first and synchronously: the default device has
+	// to be in place before Steam opens its capture a second or two after this log line,
+	// and before any display change makes a TV's HDMI audio disappear.
+	cfg := c.cfg.Get()
+	c.audioConnect(cfg)
+	if len(cfg.OnConnect) > 0 {
 		c.hooks.Run("connect", client, cfg.OnConnect, c.timeout())
 	}
 	if alreadyBlanked {
-		// Idle-blanked (or resumed): the panel is already dark and the desktop is live.
-		c.mu.Lock()
-		c.st.IdleBlank = false
-		c.mu.Unlock()
+		// Windows brings the outputs back by itself when Steam removes its virtual display
+		// between sessions, so a resumed session has to take them down again.
+		if len(outputIDs(cfg)) > 0 {
+			go c.disableOutputs(cfg)
+		}
 		return
 	}
 	go c.blank(client)
-}
-
-// IdleBlankNow blanks as the idle timer would (no wake, no session hooks) so the input-wake
-// path can be tested without waiting. Returns false if a session or restore is in progress.
-func (c *Controller) IdleBlankNow() bool {
-	cfg := c.cfg.Get()
-	c.mu.Lock()
-	if c.st.Active || c.st.Restoring || c.timer != nil || c.st.Blanked {
-		c.mu.Unlock()
-		return false
-	}
-	c.mu.Unlock()
-	log.Println("idle blank requested from the UI")
-	n := c.applyBlank(cfg)
-	c.mu.Lock()
-	c.st.Blanked, c.st.IdleBlank, c.st.LastAction = true, true, "idle-blanked (test)"
-	c.blankedAt = time.Now()
-	c.mu.Unlock()
-	log.Printf("idle-blanked: %d action(s)", n)
-	return true
-}
-
-// RunIdle blanks the displays after IdleBlankMin minutes without input (outside sessions)
-// and restores them on the next input. It replaces Windows' own display sleep, which would
-// leave Steam's capture black when a session starts against a sleeping desktop.
-func (c *Controller) RunIdle(stop <-chan struct{}) {
-	t := time.NewTicker(2 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-t.C:
-		}
-		cfg := c.cfg.Get()
-		if cfg.IdleBlankMin <= 0 || !anyBlank(cfg) {
-			continue
-		}
-		c.mu.Lock()
-		st := c.st
-		busy := c.timer != nil
-		c.mu.Unlock()
-		if st.Active || st.Restoring || busy {
-			continue
-		}
-		idle, ok := c.disp.IdleSeconds()
-		if !ok {
-			continue
-		}
-		switch {
-		case !st.Blanked && idle >= float64(cfg.IdleBlankMin)*60:
-			if c.disp.DisplayRequired() {
-				continue // a game, Big Picture, a video or a stream host is keeping the display awake
-			}
-			log.Printf("idle for %dm: blanking", cfg.IdleBlankMin)
-			n := c.applyBlank(cfg)
-			c.mu.Lock()
-			c.st.Blanked, c.st.IdleBlank, c.st.LastAction = true, true, "idle-blanked"
-			c.blankedAt = time.Now()
-			c.mu.Unlock()
-			log.Printf("idle-blanked: %d action(s)", n)
-		case st.Blanked && st.IdleBlank && st.RestorePending:
-			// An earlier "on" could not reach the panel (typically Vibeshine had the physical
-			// display disabled for a Moonlight session). Keep trying until the link is back.
-			if c.restoreDisplaysOnce(cfg) {
-				c.mu.Lock()
-				c.st.Blanked, c.st.IdleBlank, c.st.RestorePending, c.st.LastAction = false, false, false, "restored (retry)"
-				c.mu.Unlock()
-				log.Println("restored: display reachable again")
-			}
-		case st.Blanked && st.IdleBlank && idle < 3 && time.Since(c.idleBlankedAt()) > 3*time.Second:
-			log.Println("input after idle: restoring")
-			n, ok := c.applyRestoreChecked(cfg)
-			c.mu.Lock()
-			if ok {
-				c.st.Blanked, c.st.IdleBlank, c.st.LastAction = false, false, "restored (input)"
-			} else {
-				c.st.RestorePending, c.st.LastAction = true, "restore pending (no display link)"
-			}
-			c.mu.Unlock()
-			if ok {
-				log.Printf("restored: %d action(s)", n)
-			} else {
-				log.Println("restore failed: no DDC link; will retry until the display is back")
-			}
-		}
-	}
 }
 
 // Stop handles the session ending.
@@ -211,7 +133,7 @@ func (c *Controller) Stop() {
 		go c.restore(client)
 		return
 	}
-	log.Printf("session ended; restoring displays in %s unless it resumes", grace)
+	log.Printf("session ended; restoring in %s unless it resumes", grace)
 	c.timer = time.AfterFunc(grace, func() {
 		c.mu.Lock()
 		if c.timer == nil {
@@ -247,44 +169,79 @@ func shortID(id string) string {
 	return id
 }
 
-func anyBlank(cfg config.Config) bool {
-	for _, d := range cfg.Displays {
+// outputIDs lists the ticked displays.
+func outputIDs(cfg config.Config) []string {
+	var ids []string
+	for id, d := range cfg.Displays {
 		if d.Blank {
-			return true
+			ids = append(ids, id)
 		}
 	}
-	return false
-}
-
-func (c *Controller) idleBlankedAt() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.blankedAt
+	return ids
 }
 
 func (c *Controller) timeout() time.Duration {
 	return time.Duration(c.cfg.Get().TimeoutSec) * time.Second
 }
 
-// applyBlank powers the selected displays down and runs the off-commands.
-func (c *Controller) applyBlank(cfg config.Config) int {
-	_ = os.WriteFile(c.state, []byte(time.Now().Format(time.RFC3339)), 0o644)
-	n := 0
-	for id, d := range cfg.Displays {
-		if !d.Blank {
-			continue
+// outputWait is how long a session start waits for Steam's virtual display to appear;
+// outputRechecks are the delays after which the outputs are taken down again in case Steam
+// re-applied its own layout while it finished setting the virtual display up. audioWait is
+// how long a disconnect waits for its target device to reappear.
+var (
+	outputWait     = 20 * time.Second
+	outputPoll     = 500 * time.Millisecond
+	outputRechecks = []time.Duration{2 * time.Second, 3 * time.Second}
+	audioWait      = 30 * time.Second
+	audioPoll      = 500 * time.Millisecond
+)
+
+// disableOutputs switches the ticked displays off once another display exists.
+func (c *Controller) disableOutputs(cfg config.Config) {
+	ids := outputIDs(cfg)
+	if len(ids) == 0 {
+		return
+	}
+	names := make([]string, len(ids))
+	for i, id := range ids {
+		names[i] = shortID(id)
+	}
+	label := strings.Join(names, ", ")
+	deadline := time.Now().Add(outputWait)
+	for {
+		err := c.disp.DisableOutputs(ids)
+		if err == nil {
+			break
 		}
-		v := uint32(d.OffValue)
-		if v == 0 {
-			v = display.PowerOff
+		if !errors.Is(err, display.ErrNoOtherDisplay) {
+			log.Printf("switch off %s: %v", label, err)
+			return
 		}
-		if err := display.SetPowerRetry(c.disp, id, v); err != nil {
-			log.Printf("blank %s: %v (no DDC link: display still asleep, or unplugged?)", shortID(id), err)
-		} else {
-			n++
+		if time.Now().After(deadline) {
+			log.Printf("switch off %s: no virtual display appeared within %s; leaving it on (is Steam's virtual display enabled under Settings → Remote Play?)", label, outputWait)
+			return
+		}
+		time.Sleep(outputPoll)
+	}
+	log.Printf("screens off: %s", label)
+	for _, d := range outputRechecks {
+		time.Sleep(d)
+		c.mu.Lock()
+		still := c.st.Blanked || c.st.Active
+		c.mu.Unlock()
+		if !still {
+			break
+		}
+		if err := c.disp.DisableOutputs(ids); err != nil && !errors.Is(err, display.ErrNoOtherDisplay) {
+			log.Printf("switch off %s (recheck): %v", label, err)
 		}
 	}
-	for _, line := range cfg.OffCommands {
+}
+
+// runLines runs extra command lines and returns how many succeeded.
+func (c *Controller) runLines(lines []string) int {
+	n := 0
+	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -295,98 +252,150 @@ func (c *Controller) applyBlank(cfg config.Config) int {
 	return n
 }
 
-// blank is the session path: wake, settle, blank, start-hooks.
+// blank is the session path: outputs off (in the background: waiting for Steam's display
+// must not hold up the commands), darken commands, start hooks.
 func (c *Controller) blank(client string) {
 	cfg := c.cfg.Get()
-	if cfg.WakeDisplay {
-		if err := c.disp.Wake(); err != nil {
-			log.Println("wake:", err)
-		}
-		if d := time.Duration(cfg.WakeSettleSec) * time.Second; d > 0 && anyBlank(cfg) {
-			log.Printf("waiting %s for the display to settle after wake", d)
-			time.Sleep(d)
-		}
-	}
-	n := c.applyBlank(cfg)
-	log.Printf("blanked: %d action(s) for %q", n, client)
+	_ = os.WriteFile(c.state, []byte(time.Now().Format(time.RFC3339)), 0o644)
 	c.mu.Lock()
-	c.st.Blanked, c.st.IdleBlank, c.st.LastAction = true, false, "blanked"
+	c.st.Blanked, c.st.LastAction = true, "screens off"
 	c.mu.Unlock()
+	go c.disableOutputs(cfg)
+	c.runLines(cfg.OffCommands)
+	log.Printf("session active for %q", client)
 	c.hooks.Run("start", client, cfg.OnStart, c.timeout())
 }
 
-// applyRestore powers the selected displays back on and runs the on-commands.
-func (c *Controller) applyRestore(cfg config.Config) int {
-	n, _ := c.applyRestoreChecked(cfg)
-	return n
-}
-
-// restoreDisplaysOnce sends a single "on" to each ticked display; true if all succeeded.
-func (c *Controller) restoreDisplaysOnce(cfg config.Config) bool {
-	ok := true
-	for id, d := range cfg.Displays {
-		if !d.Blank {
-			continue
-		}
-		if err := c.disp.SetPower(id, display.PowerOn); err != nil {
-			ok = false
-		}
-	}
-	if ok {
-		_ = os.Remove(c.state)
-	}
-	return ok
-}
-
-// applyRestoreChecked is applyRestore that also reports whether every ticked display
-// accepted the "on" (false means at least one had no DDC link).
-func (c *Controller) applyRestoreChecked(cfg config.Config) (int, bool) {
-	n, ok := 0, true
-	for id, d := range cfg.Displays {
-		if !d.Blank {
-			continue
-		}
-		if err := display.SetPowerOn(c.disp, id); err != nil {
-			log.Printf("restore %s: %v", shortID(id), err)
-			ok = false
-		} else {
-			n++
-		}
-	}
-	for _, line := range cfg.OnCommands {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		if err := hooks.RunOne(line, c.timeout(), c.hooks.LogPath); err == nil {
-			n++
-		}
-	}
-	if ok {
-		_ = os.Remove(c.state)
-	}
-	return n, ok
-}
-
-// restore is the session path: wake, settle, restore, stop-hooks.
+// restore is the session path back: outputs on, restore commands, audio, stop hooks.
 func (c *Controller) restore(client string) {
 	cfg := c.cfg.Get()
-	if cfg.WakeDisplay && anyBlank(cfg) {
-		// Windows may have DPMS-slept the output while the panel was blanked; DDC needs the
-		// link up before "on" can reach the panel, so wake first and let it settle.
-		if err := c.disp.Wake(); err != nil {
-			log.Println("wake before restore:", err)
-		}
-		if d := time.Duration(cfg.WakeSettleSec) * time.Second; d > 0 {
-			time.Sleep(d)
+	if len(outputIDs(cfg)) > 0 {
+		if err := c.disp.RestoreOutputs(); err != nil {
+			log.Printf("restore screens: %v", err)
+		} else {
+			log.Println("screens restored")
 		}
 	}
-	n := c.applyRestore(cfg)
-	log.Printf("restored: %d action(s)", n)
+	c.runLines(cfg.OnCommands)
+	_ = os.Remove(c.state)
 	c.mu.Lock()
-	c.st.Blanked, c.st.IdleBlank, c.st.Restoring, c.st.LastAction = false, false, false, "restored"
+	c.st.Blanked, c.st.Restoring, c.st.LastAction = false, false, "restored"
 	c.mu.Unlock()
+	c.audioDisconnect(cfg)
 	if d := time.Duration(cfg.StopDelaySec) * time.Second; d > 0 && len(cfg.OnStop) > 0 {
 		time.Sleep(d)
 	}
 	c.hooks.Run("stop", client, cfg.OnStop, c.timeout())
+}
+
+// audioName is a readable label for a device id in the log.
+func (c *Controller) audioName(id string) string {
+	if devs, err := c.aud.List(); err == nil {
+		for _, d := range devs {
+			if strings.EqualFold(d.ID, id) {
+				return d.Name
+			}
+		}
+	}
+	return id
+}
+
+// audioConnect remembers the current default device and switches to the connect device.
+func (c *Controller) audioConnect(cfg config.Config) {
+	if cfg.AudioConnect == "" && cfg.AudioDisconnect != config.AudioPrevious {
+		return
+	}
+	// Snapshot once per session (a resume keeps the first one). Skip it when the default
+	// is already the connect device or Steam's own stream device: Steam may have switched
+	// before this ran, and that is not a device anyone wants to go back to.
+	c.mu.Lock()
+	have := c.prevAudio != ""
+	c.mu.Unlock()
+	if !have {
+		if cur, err := c.aud.Default(); err != nil {
+			log.Printf("audio: read default: %v", err)
+		} else if cur != "" && !strings.EqualFold(cur, cfg.AudioConnect) && !strings.Contains(c.audioName(cur), "Steam Streaming") {
+			c.mu.Lock()
+			c.prevAudio = cur
+			c.mu.Unlock()
+			_ = os.WriteFile(c.state+".audio", []byte(cur), 0o644)
+		}
+	}
+	if cfg.AudioConnect == "" {
+		return
+	}
+	if err := c.aud.SetDefault(cfg.AudioConnect); err != nil {
+		log.Printf("audio: switch to %s: %v", c.audioName(cfg.AudioConnect), err)
+		return
+	}
+	log.Printf("audio: default is now %s", c.audioName(cfg.AudioConnect))
+}
+
+// audioDisconnect switches the default device back after a session, waiting for the target
+// to reappear (a TV's HDMI audio returns a few seconds after its output does).
+func (c *Controller) audioDisconnect(cfg config.Config) {
+	c.mu.Lock()
+	prev := c.prevAudio
+	c.prevAudio = ""
+	c.mu.Unlock()
+	_ = os.Remove(c.state + ".audio")
+
+	target := cfg.AudioDisconnect
+	if target == "" {
+		return
+	}
+	previous := target == config.AudioPrevious
+	if previous {
+		if target = prev; target == "" {
+			log.Println("audio: no previous device recorded for this session; leaving the default alone")
+			return
+		}
+	}
+	name := c.audioName(target)
+	// "Previous" only undoes rpblank's own switch: if the default is no longer the connect
+	// device, someone (or Steam) changed it during the session and that choice stands. A
+	// named device is always applied.
+	if previous && cfg.AudioConnect != "" {
+		if cur, err := c.aud.Default(); err == nil && cur != "" && !strings.EqualFold(cur, cfg.AudioConnect) {
+			if !strings.EqualFold(cur, target) {
+				log.Printf("audio: default changed during the session (now %s); leaving it", c.audioName(cur))
+			}
+			return
+		}
+	}
+	deadline := time.Now().Add(audioWait)
+	waiting := false
+	for {
+		err := c.aud.SetDefault(target)
+		if err == nil {
+			log.Printf("audio: default is now %s", name)
+			return
+		}
+		if !errors.Is(err, audio.ErrNotActive) {
+			log.Printf("audio: switch to %s: %v", name, err)
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("audio: %s did not come back within %s; default left as it is", name, audioWait)
+			return
+		}
+		c.mu.Lock()
+		active := c.st.Active
+		c.mu.Unlock()
+		if active {
+			// A new session started; its connect step owns the default now. Hand the
+			// remembered device back so that session can still return to it.
+			c.mu.Lock()
+			if c.prevAudio == "" {
+				c.prevAudio = prev
+			}
+			c.mu.Unlock()
+			return
+		}
+		if !waiting {
+			waiting = true
+			log.Printf("audio: waiting for %s to come back", name)
+		}
+		time.Sleep(audioPoll)
+	}
 }
